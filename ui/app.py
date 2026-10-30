@@ -1,0 +1,840 @@
+"""Streamlit web UI for research-agent.
+
+Run with:
+    streamlit run ui/app.py
+
+Reuses the existing agent core unchanged; this module is a thin UI layer that
+collects configuration, runs a research session, streams the agent's steps live,
+renders the cited report, supports follow-up chat, source previews, persistent
+history, and HTML/Markdown export.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
+
+import streamlit as st
+
+# Make the src/ layout importable without an editable install.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+# Local UI helpers.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config_ui import (  # noqa: E402
+    PRESETS,
+    QUALITY_LABELS_VI,
+    SECRET_CONFIG_KEYS,
+    load_env_file,
+    parse_allowed_hosts,
+    validated_llm_base_url,
+)
+from helpers import (  # noqa: E402
+    add_history_item,
+    load_history,
+    parse_model_list,
+    report_to_html,
+    save_history,
+    secret_default,
+)
+from i18n import t  # noqa: E402
+from steps import render_step  # noqa: E402
+from theme import THEME_CSS, hero_html  # noqa: E402
+
+from research_agent.agent import run_session  # noqa: E402
+from research_agent.cache import CachingFetchTool, FetchCache  # noqa: E402
+from research_agent.config import request_timeout, resolve_settings  # noqa: E402
+from research_agent.error_diagnostics import diagnose_llm_error  # noqa: E402
+from research_agent.errors import ConfigError, LLMError  # noqa: E402
+from research_agent.evaluate import evaluate_report  # noqa: E402
+from research_agent.fetch_tool import HttpFetchTool  # noqa: E402
+from research_agent.llm import Message, OpenAICompatibleProvider  # noqa: E402
+from research_agent.models import Report, SessionState  # noqa: E402
+from research_agent.multi_agent import run_multi_agent  # noqa: E402
+from research_agent.observability import CollectingEmitter  # noqa: E402
+from research_agent.reflection import run_with_reflection  # noqa: E402
+from research_agent.render import render_markdown  # noqa: E402
+from research_agent.retry import RetryingLLMProvider  # noqa: E402
+from research_agent.search_tool import (  # noqa: E402
+    DuckDuckGoSearchTool,
+    FallbackSearchTool,
+    TavilySearchTool,
+)
+from research_agent.source_quality import (  # noqa: E402
+    assess_source,
+    configure_reputation_from_mapping,
+    is_local_pdf_source,
+    source_display_name,
+    source_quality_summary,
+)
+from research_agent.synthesizer import synthesize, synthesize_stream  # noqa: E402
+from research_agent.url_safety import public_http_url_error  # noqa: E402
+from research_agent.usage import UsageTracker, format_usage  # noqa: E402
+
+st.set_page_config(page_title="Research Agent", page_icon="🔎", layout="wide")
+UI_LANG = "en" if st.session_state.get("ui_lang") == "English" else "vi"
+
+# Apply the visual theme once, then render a decorative hero above the title.
+st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
+st.markdown(
+    hero_html(
+        title=t(UI_LANG, "app_title"),
+        subtitle=t(UI_LANG, "app_caption"),
+        badge=t(UI_LANG, "hero_badge"),
+        chips=[
+            t(UI_LANG, "hero_chip_search"),
+            t(UI_LANG, "hero_chip_read"),
+            t(UI_LANG, "hero_chip_cite"),
+            t(UI_LANG, "hero_chip_multi"),
+        ],
+    ),
+    unsafe_allow_html=True,
+)
+st.title(t(UI_LANG, "app_title"))
+st.caption(t(UI_LANG, "app_caption"))
+
+
+# --------------------------------------------------------------------------
+# Read-only server config (.env/secrets) + persistent history (json)
+# --------------------------------------------------------------------------
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+_SAVED = load_env_file(ENV_PATH)
+
+
+def _server_value(key: str, default: str = "") -> str:
+    """Read server-owned config without ever copying it into a user widget."""
+    saved = _SAVED.get(key)
+    if saved:
+        return saved
+    return secret_default(getattr(st, "secrets", None), dict(os.environ), key, default)
+
+
+def _initial(key: str, default: str = "") -> str:
+    """Return a non-secret widget default from server config."""
+    if key in SECRET_CONFIG_KEYS:
+        return default
+    return _server_value(key, default)
+
+
+def _validated_llm_base_url(value: str) -> str:
+    """Validate a base URL against the server-configured LLM host allowlist."""
+    allowed = parse_allowed_hosts(_server_value("RESEARCH_AGENT_ALLOWED_LLM_HOSTS"))
+    return validated_llm_base_url(value, allowed)
+
+
+# Load persistent history once into session state.
+if "history" not in st.session_state:
+    st.session_state["history"] = load_history()
+
+
+# --------------------------------------------------------------------------
+# Sidebar: configuration
+# --------------------------------------------------------------------------
+with st.sidebar:
+    st.radio("🌐 Ngôn ngữ giao diện / Interface language", ["Tiếng Việt", "English"], key="ui_lang")
+    st.header(t(UI_LANG, "cfg_header"))
+
+    _saved_provider = _SAVED.get("RESEARCH_AGENT_PROVIDER_LABEL", "Groq")
+    _provider_names = list(PRESETS.keys())
+    if _saved_provider not in _provider_names:
+        _saved_provider = "Khác (tùy chỉnh)"
+
+    _server_api_key = _server_value("RESEARCH_AGENT_API_KEY")
+    if _server_api_key:
+        credential_mode = st.radio(
+            t(UI_LANG, "credential_source_label"),
+            [t(UI_LANG, "credential_server"), t(UI_LANG, "credential_personal")],
+            help=t(UI_LANG, "credential_server_help"),
+        )
+        use_server_credential = credential_mode == t(UI_LANG, "credential_server")
+    else:
+        use_server_credential = False
+
+    if use_server_credential:
+        provider = _saved_provider
+        preset_url, preset_model = PRESETS.get(provider, ("", ""))
+        base_url = _server_value("RESEARCH_AGENT_BASE_URL", preset_url)
+        model = st.text_input(
+            t(UI_LANG, "model_label"),
+            value=_server_value("RESEARCH_AGENT_MODEL", preset_model),
+            key="server_managed_model",
+        )
+        st.text_input(
+            t(UI_LANG, "base_url_label"),
+            value=base_url,
+            disabled=True,
+            key="server_managed_base_url",
+            help=t(UI_LANG, "credential_server_help"),
+        )
+        st.caption(t(UI_LANG, "credential_server_help"))
+        api_key = _server_api_key
+    else:
+        _provider_index = _provider_names.index(_saved_provider)
+        provider = st.selectbox(
+            t(UI_LANG, "provider_label"),
+            _provider_names,
+            index=_provider_index,
+            key="personal_provider",
+        )
+        preset_url, preset_model = PRESETS[provider]
+        api_key = st.text_input(
+            t(UI_LANG, "api_key_label"),
+            type="password",
+            key="user_llm_api_key",
+            help=t(UI_LANG, "api_key_help"),
+        )
+        is_custom_provider = provider == "Khác (tùy chỉnh)"
+        custom_url_default = (
+            _initial("RESEARCH_AGENT_BASE_URL")
+            if is_custom_provider and _saved_provider == provider
+            else ""
+        )
+        base_url = st.text_input(
+            t(UI_LANG, "base_url_label"),
+            value=custom_url_default if is_custom_provider else preset_url,
+            disabled=not is_custom_provider,
+            key=f"personal_base_url_{provider}",
+            help=t(UI_LANG, "base_url_help"),
+        )
+        model_default = (
+            _initial("RESEARCH_AGENT_MODEL")
+            if is_custom_provider and _saved_provider == provider
+            else preset_model
+        )
+        model = st.text_input(
+            t(UI_LANG, "model_label"),
+            value=model_default,
+            key=f"personal_model_{provider}",
+        )
+
+    st.divider()
+    _mode_options = ["Thường", "Tự đánh giá (reflect)", "Đa agent (multi-agent)"]
+    _mode_labels = {
+        "Thường": ("Thường" if UI_LANG == "vi" else "Normal"),
+        "Tự đánh giá (reflect)": ("Tự đánh giá (reflect)" if UI_LANG == "vi" else "Self-review (reflect)"),
+        "Đa agent (multi-agent)": ("Đa agent (multi-agent)" if UI_LANG == "vi" else "Multi-agent"),
+    }
+    mode = st.radio(
+        t(UI_LANG, "mode_label"),
+        _mode_options,
+        format_func=lambda m: _mode_labels[m],
+        help=t(UI_LANG, "mode_help"),
+    )
+
+    _lang_options = ["Tiếng Việt", "English", "Tự động (theo câu hỏi)"]
+    _lang_labels = {
+        "Tiếng Việt": t(UI_LANG, "lang_vi"),
+        "English": t(UI_LANG, "lang_en"),
+        "Tự động (theo câu hỏi)": t(UI_LANG, "lang_auto"),
+    }
+    lang_label = st.radio(
+        t(UI_LANG, "report_lang_label"),
+        _lang_options,
+        format_func=lambda x: _lang_labels[x],
+        help=t(UI_LANG, "report_lang_help"),
+    )
+    lang_code = {"Tiếng Việt": "vi", "English": "en"}.get(lang_label)
+
+    _style_options = ["Tiêu chuẩn", "Ngắn gọn", "Chuyên sâu"]
+    _style_labels = {
+        "Tiêu chuẩn": t(UI_LANG, "style_standard"),
+        "Ngắn gọn": t(UI_LANG, "style_brief"),
+        "Chuyên sâu": t(UI_LANG, "style_deep"),
+    }
+    style_label = st.radio(
+        t(UI_LANG, "style_label"),
+        _style_options,
+        format_func=lambda x: _style_labels[x],
+        help=t(UI_LANG, "style_help"),
+    )
+    style_code = {"Ngắn gọn": "brief", "Tiêu chuẩn": "standard", "Chuyên sâu": "deep"}[style_label]
+
+    st.divider()
+    st.subheader(t(UI_LANG, "limits_header"))
+    max_rounds = st.slider(t(UI_LANG, "max_rounds"), 2, 20, 8)
+    max_sources = st.slider(t(UI_LANG, "max_sources"), 1, 10, 3)
+    min_domains = st.slider(t(UI_LANG, "min_domains"), 1, 5, 2)
+    per_source_chars = st.slider(t(UI_LANG, "per_source_chars"), 800, 6000, 2000, step=200,
+                                 help=t(UI_LANG, "per_source_help"))
+    round_delay = st.slider(t(UI_LANG, "round_delay"), 0.0, 10.0, 0.0, step=0.5,
+                            help=t(UI_LANG, "round_delay_help"))
+
+    st.divider()
+    st.subheader(t(UI_LANG, "advanced_header"))
+    prefetch_count = st.slider(t(UI_LANG, "prefetch_label"), 0, 10, 3, help=t(UI_LANG, "prefetch_help"))
+    cache_llm = st.checkbox(t(UI_LANG, "cache_llm_label"), value=False, help=t(UI_LANG, "cache_llm_help"))
+    recency_boost = st.checkbox(t(UI_LANG, "recency_label"), value=False, help=t(UI_LANG, "recency_help"))
+
+    user_tavily_key = st.text_input(
+        t(UI_LANG, "tavily_label"),
+        type="password",
+        key="tavily_key_val",
+        help=t(UI_LANG, "tavily_help"),
+    )
+    tavily_key = user_tavily_key or _server_value("RESEARCH_AGENT_TAVILY_API_KEY")
+
+    selected_pdf = st.file_uploader(
+        t(UI_LANG, "pdf_label"),
+        type=["pdf"],
+        help=t(UI_LANG, "pdf_help"),
+    )
+
+    reputation_json = st.text_area(
+        t(UI_LANG, "reputation_label"),
+        value=_initial("RESEARCH_AGENT_REPUTATION_JSON"),
+        height=120,
+        placeholder='{"established": ["my-lab.example"], "weights": {"my-lab.example": 15}}',
+        help=t(UI_LANG, "reputation_help"),
+    )
+
+
+# --------------------------------------------------------------------------
+# Builders
+# --------------------------------------------------------------------------
+def _build_settings():
+    safe_base_url = _validated_llm_base_url(base_url)
+    overrides = {
+        "api_key": api_key,
+        "base_url": safe_base_url,
+        "model": model,
+        "max_rounds": max_rounds,
+        "max_sources": max_sources,
+        "min_domains": min_domains,
+        "per_source_char_limit": per_source_chars,
+        "round_delay_seconds": round_delay,
+        "prefetch_count": prefetch_count,
+        "verbose": True,
+    }
+    return resolve_settings(env=dict(os.environ), cli_overrides=overrides)
+
+
+def _build_search(settings):
+    providers = []
+    if tavily_key:
+        providers.append(TavilySearchTool(api_key=tavily_key, max_results=settings.budget.max_sources))
+    providers.append(DuckDuckGoSearchTool(max_results=settings.budget.max_sources))
+    return FallbackSearchTool(providers)
+
+
+def _build_llm(settings, usage=None):
+    llm = RetryingLLMProvider(
+        OpenAICompatibleProvider(
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            model=settings.model,
+            usage=usage,
+            timeout=request_timeout(settings.budget.max_seconds, 60.0),
+        ),
+        max_attempts=settings.max_llm_attempts,
+    )
+    if cache_llm:
+        from pathlib import Path as _Path
+
+        from research_agent.llm_cache import CachingLLMProvider, LLMResponseCache
+        llm = CachingLLMProvider(llm, LLMResponseCache(_Path(".research_agent_cache") / "llm"), settings.model)
+    return llm
+
+
+def _prepare_selected_pdf(uploaded_file):
+    """Store one explicitly selected PDF in an isolated temporary directory."""
+    if uploaded_file is None:
+        return None, None
+    max_bytes = 20 * 1024 * 1024
+    data = uploaded_file.getvalue()
+    if len(data) > max_bytes:
+        raise ValueError("PDF lớn hơn giới hạn 20 MB.")
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("File đã chọn không phải PDF hợp lệ.")
+    temporary_dir = tempfile.TemporaryDirectory(prefix="research-agent-pdf-")
+    file_name = Path(getattr(uploaded_file, "name", "selected.pdf")).name
+    if not file_name or file_name == "." or not file_name.lower().endswith(".pdf"):
+        file_name = "selected.pdf"
+    path = Path(temporary_dir.name) / file_name
+    path.write_bytes(data)
+    return temporary_dir, path
+
+
+def _request_research_retry() -> None:
+    """Queue one user-initiated retry for the next Streamlit rerun."""
+    st.session_state["_retry_research"] = True
+
+
+def _show_llm_error(exc: LLMError, retry_key: str | None = None) -> None:
+    """Render a safe diagnosis rather than the provider's raw response body."""
+    diagnosis = diagnose_llm_error(exc)
+    st.error(f"**{diagnosis.title_vi}**\n\n{diagnosis.detail_vi}")
+    st.caption("Gợi ý: " + " • ".join(diagnosis.suggestions_vi))
+    if diagnosis.retryable and retry_key is not None:
+        st.caption("Bạn có thể thử lại thủ công; agent sẽ chạy một phiên mới.")
+        st.button(
+            "🔁 Thử lại",
+            key=retry_key,
+            type="primary",
+            use_container_width=True,
+            on_click=_request_research_retry,
+        )
+
+
+# --------------------------------------------------------------------------
+# Main: question + run
+# --------------------------------------------------------------------------
+auto_retry_research = bool(st.session_state.pop("_retry_research", False))
+question = st.text_input(t(UI_LANG, "question_label"), placeholder=t(UI_LANG, "question_placeholder"))
+run_clicked = st.button(t(UI_LANG, "run_btn"), type="primary", use_container_width=True) or auto_retry_research
+
+if run_clicked:
+    if not question.strip():
+        st.error(t(UI_LANG, "err_question"))
+    elif not api_key.strip():
+        st.error(t(UI_LANG, "err_api_key"))
+    else:
+        try:
+            settings = _build_settings()
+        except ConfigError as exc:
+            st.error(f"Lỗi cấu hình: {exc}")
+            st.stop()
+
+        # Optional: augment source-credibility ranking from the reputation box.
+        if reputation_json.strip():
+            try:
+                configure_reputation_from_mapping(json.loads(reputation_json))
+            except (ValueError, TypeError) as exc:
+                st.error(t(UI_LANG, "reputation_err", err=str(exc)))
+                st.stop()
+
+        try:
+            _pdf_temp_dir, approved_pdf_path = _prepare_selected_pdf(selected_pdf)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        if approved_pdf_path is not None:
+            settings = replace(settings, allowed_pdf_paths=(approved_pdf_path,))
+
+        usage_tracker = UsageTracker()
+        llm = _build_llm(settings, usage=usage_tracker)
+        search = _build_search(settings)
+        fetch = CachingFetchTool(
+            HttpFetchTool(
+                blocked_domains=settings.blocked_domains,
+                per_source_char_limit=settings.per_source_char_limit,
+                timeout=request_timeout(settings.budget.max_seconds, 30.0),
+            ),
+            FetchCache(Path(".research_agent_cache"), ttl_seconds=settings.cache_ttl),
+            url_validator=public_http_url_error,
+        )
+
+        # Optional recency steering (checkbox or auto-detected from the question).
+        from research_agent.recency import recency_directive, wants_recency
+        research_directive = (
+            recency_directive() if (recency_boost or wants_recency(question)) else None
+        )
+
+        st.subheader(t(UI_LANG, "agent_working"))
+        steps_box = st.empty()
+        steps: list[str] = []
+
+        def _on_event(line: str, event) -> None:
+            steps.append(render_step(event, UI_LANG))
+            steps_box.markdown("\n\n".join(steps[-25:]))
+
+        emit = CollectingEmitter(verbose=True, on_event=_on_event)
+        synth_fn = partial(synthesize, language=lang_code, style=style_code)
+
+        started = time.time()
+        report = None
+        stream_in_normal = mode.startswith("Thường")
+
+        with st.status(t(UI_LANG, "researching"), expanded=True) as status:
+            try:
+                if mode.startswith("Đa agent"):
+                    report = run_multi_agent(question, settings, llm, search, fetch, synth_fn, time.time, emit)
+                elif mode.startswith("Tự đánh giá"):
+                    report = run_with_reflection(question, settings, llm, search, fetch, synth_fn,
+                                                 time.time, emit, directive=research_directive)
+                elif stream_in_normal:
+                    # Normal mode: gather sources first (no synthesis), so we can
+                    # stream the report text afterwards.
+                    state = SessionState(question=question, started_at=time.time())
+
+                    def _collect_only(_q, _srcs, _llm, _tool_notes):
+                        return Report(question=_q, body_markdown="", sources=tuple(_srcs))
+
+                    pre = run_session(
+                        question,
+                        settings,
+                        llm,
+                        search,
+                        fetch,
+                        _collect_only,
+                        time.time,
+                        emit,
+                        initial_state=state,
+                        directive=research_directive,
+                    )
+                    gathered = list(pre.sources)
+                else:
+                    report = run_session(question, settings, llm, search, fetch, synth_fn,
+                                         time.time, emit, directive=research_directive)
+                status.update(label=t(UI_LANG, "done"), state="complete")
+            except LLMError as exc:
+                status.update(label=t(UI_LANG, "error"), state="error")
+                _show_llm_error(exc, retry_key="retry_research")
+                st.stop()
+
+        # Stream the report body live for normal mode (into a temporary area
+        # that is cleared afterwards, so the final formatted report below is the
+        # single source of truth).
+        if stream_in_normal:
+            st.subheader(t(UI_LANG, "report_writing"))
+            stream_area = st.empty()
+            gen = synthesize_stream(
+                question,
+                gathered,
+                llm,
+                tool_notes=state.tool_notes,
+                language=lang_code,
+                style=style_code,
+            )
+            _result = {}
+
+            def _text_stream():
+                try:
+                    while True:
+                        yield next(gen)
+                except StopIteration as stop:
+                    _result["report"] = stop.value
+
+            try:
+                with stream_area.container():
+                    st.write_stream(_text_stream())
+            except LLMError as exc:
+                _show_llm_error(exc, retry_key="retry_research")
+                st.stop()
+            report = _result.get("report") or synthesize(
+                question,
+                gathered,
+                llm,
+                tool_notes=state.tool_notes,
+                language=lang_code,
+                style=style_code,
+            )
+            stream_area.empty()
+
+        elapsed = time.time() - started
+
+        markdown = render_markdown(report)
+        # Keep source URL + a content preview for the "source preview" feature.
+        sources = [
+            {
+                "url": s.url,
+                "label": source_display_name(s.url),
+                "preview": (s.content or "")[:1500],
+                "quality": source_quality_summary(s).label,
+                "quality_score": str(source_quality_summary(s).score),
+                "quality_reason": source_quality_summary(s).reason,
+            }
+            for s in report.sources
+        ]
+
+        st.session_state["history"] = add_history_item(
+            st.session_state["history"],
+            question=question,
+            markdown=markdown,
+            sources=sources,
+            elapsed=elapsed,
+            mode=mode,
+            usage=format_usage(usage_tracker, settings.model),
+        )
+        # Remember the latest report for the follow-up chat context.
+        st.session_state["last_report"] = {"question": question, "markdown": markdown}
+        st.session_state["chat"] = []
+
+# --------------------------------------------------------------------------
+# Tab renderers (defined here, wired into st.tabs at the bottom)
+# --------------------------------------------------------------------------
+def render_report_tab() -> None:
+    """Latest report with export, source preview, and grounded follow-up chat."""
+    history = st.session_state.get("history", [])
+    if not history:
+        st.info(t(UI_LANG, "no_report_yet"))
+        return
+    latest = history[0]
+
+    st.subheader(t(UI_LANG, "report_header"))
+    st.markdown(latest["markdown"])
+
+    st.info(t(UI_LANG, "stats_line", elapsed=latest["elapsed"], n=len(latest["sources"]), mode=latest["mode"]))
+    if latest.get("usage"):
+        st.caption(f"🧮 {latest['usage']}")
+
+    # --- Export: Markdown / HTML / PDF / DOCX ---
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.download_button(
+            t(UI_LANG, "dl_md"),
+            data=latest["markdown"],
+            file_name="bao-cao.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            t(UI_LANG, "dl_html"),
+            data=report_to_html(latest["question"], latest["markdown"]),
+            file_name="bao-cao.html",
+            mime="text/html",
+            use_container_width=True,
+            help=t(UI_LANG, "dl_html_help"),
+        )
+    with c3:
+        try:
+            from research_agent.pdf_export import render_pdf_bytes
+
+            pdf_bytes = render_pdf_bytes(latest["question"], latest["markdown"])
+            st.download_button(
+                t(UI_LANG, "dl_pdf"),
+                data=pdf_bytes,
+                file_name="bao-cao.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                help=t(UI_LANG, "dl_pdf_help"),
+            )
+        except Exception:  # noqa: BLE001 - fall back gracefully to HTML export
+            st.button(
+                t(UI_LANG, "dl_pdf"),
+                disabled=True,
+                use_container_width=True,
+                help=t(UI_LANG, "dl_pdf_disabled"),
+            )
+    with c4:
+        try:
+            from research_agent.docx_export import render_docx_bytes
+
+            docx_bytes = render_docx_bytes(latest["question"], latest["markdown"])
+            st.download_button(
+                t(UI_LANG, "dl_docx"),
+                data=docx_bytes,
+                file_name="bao-cao.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+                help=t(UI_LANG, "dl_docx_help"),
+            )
+        except Exception:  # noqa: BLE001 - fall back gracefully
+            st.button(
+                t(UI_LANG, "dl_docx"),
+                disabled=True,
+                use_container_width=True,
+                help=t(UI_LANG, "dl_docx_disabled"),
+            )
+
+    # --- Source preview: click to expand the text the agent actually read ---
+    st.subheader(t(UI_LANG, "sources_header"))
+    if not latest["sources"]:
+        st.caption(t(UI_LANG, "no_sources"))
+    for i, s in enumerate(latest["sources"], 1):
+        display_name = s.get("label", source_display_name(s["url"]))
+        legacy_quality = assess_source(s["url"], s.get("preview"))
+        quality = s.get("quality", legacy_quality.label)
+        score = s.get("quality_score", str(legacy_quality.score))
+        reason = s.get("quality_reason", legacy_quality.reason)
+        quality_label = QUALITY_LABELS_VI.get(quality, "Chưa rõ")
+        with st.expander(f"{i}. {display_name} · {quality_label} ({score}/100)"):
+            if is_local_pdf_source(s["url"]):
+                st.caption(t(UI_LANG, "pdf_no_origin"))
+            else:
+                st.link_button(t(UI_LANG, "open_source"), s["url"])
+            if s.get("quality_reason"):
+                st.caption("Đánh giá tự động (tham khảo): " + s["quality_reason"])
+            if not s.get("quality_reason") and reason:
+                st.caption("Automatic quality estimate: " + reason)
+            preview = s.get("preview") or ""
+            if preview:
+                st.caption(t(UI_LANG, "preview_caption"))
+                st.text(preview + ("…" if len(preview) >= 1500 else ""))
+            else:
+                st.caption(t(UI_LANG, "no_preview"))
+
+
+    # --- Follow-up chat grounded in the latest report ---
+    st.subheader(t(UI_LANG, "chat_header"))
+    st.caption(t(UI_LANG, "chat_caption"))
+
+    if "chat" not in st.session_state:
+        st.session_state["chat"] = []
+
+    for turn in st.session_state["chat"]:
+        with st.chat_message(turn["role"]):
+            st.markdown(turn["content"])
+
+    follow_up = st.chat_input(t(UI_LANG, "chat_placeholder"))
+    if follow_up:
+        if not api_key.strip():
+            st.error(t(UI_LANG, "chat_need_key"))
+        else:
+            st.session_state["chat"].append({"role": "user", "content": follow_up})
+            with st.chat_message("user"):
+                st.markdown(follow_up)
+
+            try:
+                settings = _build_settings()
+                chat_llm = _build_llm(settings)
+            except ConfigError as exc:
+                st.error(f"Lỗi cấu hình: {exc}")
+                st.stop()
+
+            # Build grounded messages: report as context + prior chat turns.
+            lang_note = ""
+            if lang_code == "vi":
+                lang_note = " Trả lời bằng tiếng Việt."
+            elif lang_code == "en":
+                lang_note = " Answer in English."
+            messages = [
+                Message(
+                    role="system",
+                    content=(
+                        "You are a helpful assistant answering follow-up questions about a "
+                        "research report. Base your answers ONLY on the report below; if the "
+                        "report doesn't contain the answer, say so honestly." + lang_note
+                    ),
+                ),
+                Message(role="user", content=f"REPORT:\n{latest['markdown']}"),
+            ]
+            for turn in st.session_state["chat"]:
+                messages.append(Message(role=turn["role"], content=turn["content"]))
+
+            with st.chat_message("assistant"):
+                with st.spinner(t(UI_LANG, "answering")):
+                    try:
+                        answer = chat_llm.generate(messages)
+                    except LLMError as exc:
+                        diagnosis = diagnose_llm_error(exc)
+                        answer = (
+                            f"**{diagnosis.title_vi}**\n\n{diagnosis.detail_vi}\n\n"
+                            f"_Gợi ý: {' • '.join(diagnosis.suggestions_vi)}_"
+                        )
+                st.markdown(answer)
+            st.session_state["chat"].append({"role": "assistant", "content": answer})
+
+
+# --------------------------------------------------------------------------
+# Side-by-side model comparison
+# --------------------------------------------------------------------------
+def render_compare_tab() -> None:
+    """Run one question across multiple models and compare reports + metrics."""
+    st.caption(t(UI_LANG, "compare_caption"))
+    compare_question = st.text_input(
+        t(UI_LANG, "compare_question"),
+        value=question or "",
+        key="compare_question",
+    )
+    compare_models_text = st.text_input(
+        t(UI_LANG, "compare_models"),
+        value=model,
+        key="compare_models",
+        help=t(UI_LANG, "compare_models_help"),
+    )
+    if st.button(t(UI_LANG, "compare_btn"), use_container_width=True, key="run_compare"):
+        models_to_compare = parse_model_list(compare_models_text)
+        if not compare_question.strip():
+            st.error(t(UI_LANG, "err_question"))
+        elif not api_key.strip():
+            st.error(t(UI_LANG, "err_api_key"))
+        elif len(models_to_compare) < 2:
+            st.error(t(UI_LANG, "compare_err_models"))
+        else:
+            try:
+                base_settings = _build_settings()
+            except ConfigError as exc:
+                st.error(f"Lỗi cấu hình: {exc}")
+                st.stop()
+            search = _build_search(base_settings)
+            cols = st.columns(len(models_to_compare))
+            for col, model_name in zip(cols, models_to_compare, strict=False):
+                with col:
+                    st.markdown(f"**{model_name}**")
+                    run_settings = replace(base_settings, model=model_name)
+                    run_llm = _build_llm(run_settings)
+                    run_fetch = CachingFetchTool(
+                        HttpFetchTool(
+                            blocked_domains=run_settings.blocked_domains,
+                            per_source_char_limit=run_settings.per_source_char_limit,
+                            timeout=request_timeout(run_settings.budget.max_seconds, 30.0),
+                        ),
+                        FetchCache(Path(".research_agent_cache"), ttl_seconds=run_settings.cache_ttl),
+                        url_validator=public_http_url_error,
+                    )
+                    synth_fn = partial(synthesize, language=lang_code, style=style_code) if lang_code else partial(synthesize, style=style_code)
+                    try:
+                        with st.spinner(f"Đang chạy {model_name}..."):
+                            cmp_report = run_session(
+                                compare_question, run_settings, run_llm, search, run_fetch,
+                                synth_fn, time.time, CollectingEmitter(verbose=False),
+                            )
+                    except LLMError as exc:
+                        diagnosis = diagnose_llm_error(exc)
+                        st.error(f"{diagnosis.title_vi}")
+                        continue
+                    metrics = evaluate_report(cmp_report)
+                    st.caption(
+                        f"📚 {metrics.n_sources} nguồn · 🌐 {metrics.n_domains} tên miền · "
+                        f"🔖 {metrics.n_citations} trích dẫn · ⭐ {metrics.avg_source_quality:.0f}/100"
+                    )
+                    st.markdown(render_markdown(cmp_report))
+
+
+# --------------------------------------------------------------------------
+# Persistent history (survives app restarts)
+# --------------------------------------------------------------------------
+def render_history_tab() -> None:
+    """Persistent research history (survives app restarts)."""
+    history = st.session_state.get("history", [])
+    if not history:
+        st.caption(t(UI_LANG, "history_empty"))
+        return
+    st.subheader(t(UI_LANG, "history_header"))
+    st.caption(t(UI_LANG, "history_caption"))
+    if st.button(t(UI_LANG, "clear_history")):
+        st.session_state["history"] = []
+        save_history([])
+        st.rerun()
+
+    for idx, item in enumerate(history):
+        n_src = len(item.get("sources", []))
+        title = (f"[{item['when']}] {item['question']}  ·  {item['mode']}  ·  "
+                 f"{item['elapsed']:.1f}s  ·  {n_src} nguồn")
+        with st.expander(title):
+            st.markdown(item["markdown"])
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                st.download_button(
+                    "⬇️ Markdown", data=item["markdown"],
+                    file_name=f"bao-cao-{idx+1}.md", mime="text/markdown",
+                    key=f"dl_md_{idx}", use_container_width=True,
+                )
+            with cc2:
+                st.download_button(
+                    "⬇️ HTML", data=report_to_html(item["question"], item["markdown"]),
+                    file_name=f"bao-cao-{idx+1}.html", mime="text/html",
+                    key=f"dl_html_{idx}", use_container_width=True,
+                )
+
+
+# --------------------------------------------------------------------------
+# Layout: three tabs (Report / Compare / History) below the question + run bar
+# --------------------------------------------------------------------------
+tab_report, tab_compare, tab_history = st.tabs(
+    [t(UI_LANG, "tab_report"), t(UI_LANG, "tab_compare"), t(UI_LANG, "tab_history")]
+)
+with tab_report:
+    render_report_tab()
+with tab_compare:
+    render_compare_tab()
+with tab_history:
+    render_history_tab()

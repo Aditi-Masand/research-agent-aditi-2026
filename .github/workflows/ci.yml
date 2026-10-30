@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install a Unicode font (so PDF export tests run, not skip)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.12"
+          enable-cache: true
+
+      - name: Verify dependency lock
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --all-extras --frozen
+
+      - name: Lint (ruff)
+        run: uv run --frozen ruff check src tests ui
+
+      - name: Compile source and UI
+        run: uv run --frozen python -m compileall -q src ui
+
+      - name: Type check (mypy)
+        run: uv run --frozen mypy src
+
+      - name: Run tests (pytest + hypothesis) with coverage
+        run: uv run --frozen pytest --cov=research_agent --cov-report=term-missing --cov-fail-under=80
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.10.12"
+          enable-cache: true
+
+      - name: Export the locked dependency set
+        run: uv export --frozen --all-extras --no-hashes --no-emit-project -o requirements-audit.txt
+
+      - name: Audit dependencies for known vulnerabilities (pip-audit)
+        run: uvx pip-audit -r requirements-audit.txt

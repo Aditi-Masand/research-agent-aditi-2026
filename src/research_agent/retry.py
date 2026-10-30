@@ -1,0 +1,147 @@
+"""Retry logic for LLM calls.
+
+The attempt-counting policy is a pure function so it can be property-tested
+(Property 9): the first failed call counts as attempt #1, so ``max_attempts``
+is an upper bound on the total number of calls.
+"""
+from __future__ import annotations
+
+import time
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any
+
+from .errors import LLMError
+from .llm import LLMProvider, Message, RawDecision, ToolSpec, TransientLLMError
+
+
+def should_retry(attempt: int, max_attempts: int) -> bool:
+    """Pure: may we make another attempt after ``attempt`` failed calls?
+
+    ``attempt`` is the number of calls already made (>= 1). We retry only while
+    fewer than ``max_attempts`` calls have been made.
+    """
+    return attempt < max_attempts
+
+
+def next_delay(
+    attempt: int,
+    base_delay: float,
+    retry_after: float | None = None,
+    max_delay: float = 60.0,
+) -> float:
+    """Pure: choose the wait before the next retry.
+
+    Honors a server-provided ``retry_after`` hint when present, otherwise uses
+    exponential backoff. The result is clamped to ``[0, max_delay]``.
+    """
+    if retry_after is not None and retry_after >= 0:
+        return min(retry_after, max_delay)
+    return min(base_delay * (2 ** (attempt - 1)), max_delay)
+
+
+def call_with_retry(
+    fn: Callable[[], Any],
+    max_attempts: int,
+    sleep: Callable[[float], None] = time.sleep,
+    base_delay: float = 0.5,
+    time_left: Callable[[], float] | None = None,
+) -> Any:
+    """Invoke ``fn`` retrying only TransientLLMError, up to ``max_attempts`` calls.
+
+    The first (failed) call is attempt #1. Honors a Retry-After hint carried by
+    the error when present. Re-raises the last error once attempts are spent.
+
+    When ``time_left`` is provided it makes retries respect a hard deadline:
+    once no time remains we stop retrying, and every backoff sleep is clamped so
+    it never waits past the deadline.
+    """
+    if max_attempts < 1:
+        max_attempts = 1
+    attempt = 0
+    last_exc: Exception | None = None
+    while attempt < max_attempts:
+        attempt += 1
+        try:
+            return fn()
+        except TransientLLMError as exc:
+            last_exc = exc
+            if not should_retry(attempt, max_attempts):
+                break
+            delay = next_delay(attempt, base_delay, getattr(exc, "retry_after", None))
+            if time_left is not None:
+                remaining = time_left()
+                if remaining <= 0:
+                    break
+                delay = min(delay, remaining)
+            sleep(delay)
+    raise LLMError(
+        f"LLM call failed after {max_attempts} attempt(s): {last_exc}"
+    ) from last_exc
+
+
+class RetryingLLMProvider:
+    """Decorator that adds retry-on-transient-error to any LLMProvider."""
+
+    def __init__(
+        self,
+        inner: LLMProvider,
+        max_attempts: int,
+        sleep: Callable[[float], None] = time.sleep,
+        time_left: Callable[[], float] | None = None,
+    ) -> None:
+        self._inner = inner
+        self._max_attempts = max_attempts
+        self._sleep = sleep
+        self._time_left = time_left
+
+    def set_time_left(self, time_left: Callable[[], float] | None) -> None:
+        """Attach a remaining-time source so retries honor a hard deadline.
+
+        Called by ``run_session`` with the session's own clock so backoff waits
+        never push a run past ``max_seconds``.
+        """
+        self._time_left = time_left
+
+    def decide_action(self, messages: Sequence[Message], tools: Sequence[ToolSpec]) -> RawDecision:
+        return call_with_retry(
+            lambda: self._inner.decide_action(messages, tools),
+            self._max_attempts,
+            self._sleep,
+            time_left=self._time_left,
+        )
+
+    def generate(self, messages: Sequence[Message]) -> str:
+        return call_with_retry(
+            lambda: self._inner.generate(messages),
+            self._max_attempts,
+            self._sleep,
+            time_left=self._time_left,
+        )
+
+    def generate_stream(self, messages: Sequence[Message]) -> Iterator[str]:
+        """Stream text chunks from the inner provider.
+
+        Retries only apply before the first chunk is produced; once streaming
+        has started we don't restart mid-response. Falls back to a single-shot
+        ``generate`` if the inner provider doesn't support streaming.
+        """
+        inner_stream = getattr(self._inner, "generate_stream", None)
+        if inner_stream is None:
+            yield self.generate(messages)
+            return
+
+        def _start() -> Iterator[str]:
+            gen = inner_stream(messages)
+            first = next(gen, None)
+            return _chain(first, gen)
+
+        def _chain(first, gen):
+            if first is not None:
+                yield first
+            yield from gen
+
+        # Retry only the initial connection (until the first chunk).
+        stream = call_with_retry(
+            _start, self._max_attempts, self._sleep, time_left=self._time_left
+        )
+        yield from stream
